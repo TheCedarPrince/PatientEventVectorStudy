@@ -1,0 +1,133 @@
+using DrWatson
+using HealthBase
+
+using CSV
+using DataFrames
+using DataStructures
+using DuckDB
+using FunSQL
+using JSON3
+using OHDSIAPI
+using SparseArrays
+
+import DBInterface:
+  connect,
+  execute
+import OHDSICohortExpressions:
+    translate,
+    Model
+
+definition_id = 1788230
+
+download_cohort_definition(
+  definition_id; 
+  metadata = cohortsdir("cohort_information.json"), 
+  output_dir = cohortsdir()
+)
+
+conn = connect(
+  DuckDB.DB, 
+  datadir("exp_raw", "synthea_1M_3YR.duckdb")
+)
+
+catalog = FunSQL.reflect(
+  conn;
+  schema = "dbt_synthea_dev",
+  dialect=:postgresql
+);
+
+cohort_expression = read(cohortsdir("$(definition_id).json"), String)
+# cohort_expression = cohortsdir("$(definition_id).json") |> JSON3.read |> x -> x.expression
+
+fun_sql = translate(
+   cohort_expression,
+   cohort_definition_id = 1
+);
+
+sql = FunSQL.render(catalog, fun_sql);
+
+execute(conn,
+    """
+    DELETE FROM
+        dbt_synthea_dev.cohort;
+    """
+)
+
+execute(conn,
+    """
+    INSERT INTO
+        dbt_synthea_dev.cohort
+    SELECT
+        *
+    FROM
+        ($sql) AS foo;
+    """
+)
+
+# TODO: Maybe option to create multiple files with concept set names?
+download_concept_set(
+  definition_id; 
+  deflate = true,
+  output_dir = cohortsdir()
+)
+
+cohort = execute(conn, 
+    """
+    SELECT 
+        subject_id
+    FROM
+        dbt_synthea_dev.cohort
+    WHERE
+        cohort_definition_id = 1;
+    """
+)
+
+concepts = CSV.read(cohortsdir("cohortdefinition_$(definition_id)_includedConcepts.csv"), DataFrame)
+# TODO: Generalize row.Name to the actual concept set name
+# medications = filter(row -> row.Name == "Antihyperglycemic Medications", concepts).var"Concept ID"
+medications = concepts."Concept ID"
+
+# NOTE: Probably want to do sorting in the query
+df = execute(conn,
+"""
+SELECT
+  *
+FROM 
+  (
+    SELECT 
+      person_id,
+      drug_concept_id,
+      drug_exposure_start_date,
+      drug_exposure_end_date
+    FROM 
+      dbt_synthea_dev.drug_exposure
+    WHERE
+      person_id IN ($(join(cohort.tbl.subject_id, ",")))
+  ) t1
+WHERE
+  t1.drug_concept_id IN ($(join(medications, ",")));
+  """) |> 
+DataFrame |> 
+x -> sort(x, [:person_id, :drug_exposure_start_date])
+
+
+amounts = execute(conn,
+"""
+SELECT
+  drug_concept_id, 
+  numerator_value as amount
+FROM
+  dbt_synthea_dev.drug_strength
+WHERE
+  drug_concept_id IN ($(join(patient_df.drug_concept_id |> unique, ","
+)));
+""") |> 
+DataFrame
+
+counts = counter(df.person_id)
+patient_id = nlargest(counts) |> first |> first
+patient_df = filter(row -> row.person_id == patient_id, df) |> unique
+
+mdv_size = length(df.drug_concept_id |> unique)
+
+
